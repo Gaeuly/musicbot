@@ -1,0 +1,165 @@
+/**
+ * TRINOX STUDIO - Bre4d777
+ * give credits or ill touch you in your dreams
+ */
+import {
+  Client,
+  GatewayIntentBits,
+  Collection,
+  DefaultWebSocketManagerOptions
+} from 'discord.js';
+import { ClusterClient, getInfo } from 'discord-hybrid-sharding';
+import { CommandHandler } from './CommandHandler.js';
+import { EventHandler } from './EventHandler.js';
+import { MusicManager } from '../managers/MusicManager.js';
+import { logger } from '../utils/logger.js';
+import { config } from '../config/config.js';
+import { db } from '../database/DatabaseManager.js';
+import { emoji } from '../config/emoji.js';
+
+const intents = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMembers,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.GuildMessageReactions,
+  GatewayIntentBits.GuildMessageTyping,
+  GatewayIntentBits.GuildVoiceStates,
+  GatewayIntentBits.GuildEmojisAndStickers,
+  GatewayIntentBits.GuildIntegrations,
+  GatewayIntentBits.GuildWebhooks,
+  GatewayIntentBits.GuildInvites,
+  GatewayIntentBits.GuildScheduledEvents,
+  GatewayIntentBits.GuildModeration,
+  GatewayIntentBits.DirectMessages,
+  GatewayIntentBits.DirectMessageReactions,
+  GatewayIntentBits.DirectMessageTyping,
+  GatewayIntentBits.MessageContent
+];
+
+export class BotClient extends Client {
+  constructor(options = {}) {
+    super({
+      shards: getInfo().SHARD_LIST,
+      shardCount: getInfo().TOTAL_SHARDS,
+      intents,
+      ...options
+    });
+
+    this.cluster = new ClusterClient(this);
+    this.commands = new Collection();
+    this.logger = logger;
+    this.config = config;
+    this.emoji = emoji;
+
+    this.music = new MusicManager(this);
+    this.commandHandler = new CommandHandler(this, this.music);
+    this.eventHandler = new EventHandler(this, this.music);
+
+    this.db = db;
+    this.startTime = Date.now();
+  }
+
+  async init() {
+    try {
+      logger.info('ByteCord', `Initializing bot (Cluster ${this.cluster.id})...`);
+      DefaultWebSocketManagerOptions.identifyProperties.browser = 'Discord iOS';
+
+      await this.eventHandler.loadEvents();
+      await this.commandHandler.loadCommands();
+      await this.login(this.config.token);
+
+      logger.success('ByteCord', `Cluster ${this.cluster.id} initialized successfully`);
+      return true;
+    } catch (error) {
+      logger.error('ByteCord', 'Failed to initialize bot', error);
+      return false;
+    }
+  }
+
+  get uptime() {
+    return Date.now() - this.startTime;
+  }
+
+  async reload() {
+    try {
+      logger.info('ByteCord', 'Reloading commands and events...');
+      await this.eventHandler.reloadEvents();
+      await this.commandHandler.reloadCommands();
+      logger.success('ByteCord', 'Reloaded commands and events successfully');
+      return true;
+    } catch (error) {
+      logger.error('ByteCord', 'Failed to reload commands and events', error);
+      return false;
+    }
+  }
+
+  async cleanup() {
+    try {
+      logger.info('ByteCord', 'Cleaning up before shutdown...');
+
+      const activePlayers = this.music.kazagumo?.players?.size || 0;
+      if (activePlayers > 0) {
+        logger.info('ByteCord', `Saving state for ${activePlayers} active players`);
+
+        for (const [guildId, player] of this.music.kazagumo.players) {
+          try {
+            const currentTrack = player.queue?.current
+              ? this.cleanTrackForStorage(player.queue.current)
+              : null;
+
+            let queueTracks = [];
+            try {
+              if (player.queue?.data?.length) {
+                queueTracks = player.queue.data.map(track =>
+                  this.cleanTrackForStorage(track)
+                );
+              } else if (Array.isArray(player.queue)) {
+                queueTracks = player.queue.map(track =>
+                  this.cleanTrackForStorage(track)
+                );
+              }
+            } catch (queueError) {
+              logger.warn('ByteCord', `Could not extract queue for guild ${guildId}`, queueError);
+            }
+
+            db.savePlayerState(guildId, {
+              voiceChannelId: player.voiceId,
+              textChannelId: player.textId,
+              volume: player.volume,
+              loopMode: player.loop,
+              paused: player.paused,
+              currentTrack,
+              queue: queueTracks
+            });
+
+            player.destroy();
+          } catch (playerError) {
+            logger.error('ByteCord', `Failed to save state for player in guild ${guildId}`, playerError);
+          }
+        }
+      }
+
+      db.closeAll();
+      logger.success('ByteCord', 'Cleanup completed successfully');
+    } catch (error) {
+      logger.error('ByteCord', 'Error during cleanup', error);
+    }
+  }
+
+  cleanTrackForStorage(track) {
+    if (!track) return null;
+
+    try {
+      return {
+        // Your track properties here
+        title: track.title,
+        uri: track.uri,
+        author: track.author,
+        duration: track.duration
+      };
+    } catch (e) {
+      logger.warn('ByteCord', 'Failed to clean track for storage', e);
+      return null;
+    }
+  }
+}

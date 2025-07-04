@@ -1,0 +1,705 @@
+/**
+ * Muffin STUDIO - Bre4d777 & prayag 
+ * https://discord.gg/TRPqseUq32
+ * give credits or ill touch you in your dreams
+ */
+
+
+import { logger } from '../utils/logger.js';
+import { QueueManager } from './QueueManager.js';
+import { db } from '../database/DatabaseManager.js';
+import client from '../index.js'
+/**
+ * PlayerManager - Unified player control methods
+ */
+export class PlayerManager {
+  /**
+   * Create a new PlayerManager instance
+   * @param {object} player - Kazagumo player instance
+   */
+  constructor(player) {
+    this.player = player;
+
+    // Initialize the queue manager with enhanced error handling
+    try {
+      this.queue = new QueueManager(player);
+    } catch (error) {
+      logger.error('PlayerManager', 'Error initializing QueueManager', error);
+      this.queue = new QueueManager(null); // Fallback to local queue
+    }
+
+    // Cache properties
+    this.guildId = player?.guildId;
+    this.textChannelId = player?.textId;
+    this.voiceChannelId = player?.voiceId;
+  }
+
+  /**
+   * Check if player is valid
+   * @returns {boolean} - Whether the player is valid
+   */
+  isValid() {
+    return !!this.player;
+  }
+
+  /**
+   * Start or resume playback
+   * @param {KazagumoTrack|null} track - Optional track to play
+   * @returns {Promise<boolean>} - Whether playback started
+   */
+  async play(track = null) {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return false;
+      }
+
+      // If player is paused and no track is provided, resume playback
+      if (this.player.paused && !track) {
+        return await this.resume();
+      }
+
+      // If a specific track is provided, try to play it directly
+      if (track) {
+
+        // Check if the player has play method
+        if (typeof this.player.play === 'function') {
+          await this.player.play(track);
+          return true;
+        }
+        // If the player is a Kazagumo player, ensure we're using the right method
+        else if (this.player.queue && typeof this.player.queue.add === 'function') {
+          await this.player.queue.add(track, 0); // Add to the front of queue
+
+          if (!this.player.playing) {
+            // Call the proper Kazagumo play method
+            if (typeof this.player.play === 'function') {
+              await this.player.play();
+            } else {
+              logger.error('PlayerManager', 'Player does not have play method');
+              return false;
+            }
+          }
+          return true;
+        } else {
+          logger.error('PlayerManager', 'Player does not have play or queue.add method');
+          return false;
+        }
+      }
+
+      // If the queue is empty and no track is provided, return false
+      if (!this.player.queue ||
+          (Array.isArray(this.player.queue) && this.player.queue.length === 0) ||
+          (typeof this.player.queue === 'object' && this.player.queue.length === 0)) {
+        logger.player('PlayerManager', 'Cannot play - queue is empty', {
+          queue: typeof this.player.queue,
+          queueLength: this.player.queue ? (Array.isArray(this.player.queue) ? this.player.queue.length : this.player.queue.length || 0) : 0,
+          hasCurrent: !!this.player.queue.current
+        });
+        return false;
+      }
+
+
+      try {
+        // Check if the player has play method
+        if (typeof this.player.play === 'function') {
+          await this.player.play();
+       
+          return true;
+        } else {
+          logger.error('PlayerManager', 'Player does not have play method');
+          return false;
+        }
+      } catch (error) {
+        // Improved error handling: log and continue
+        logger.error('PlayerManager', 'Failed to start playback from queue', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to play from queue. Will continue and allow user to retry.');
+        }
+        return false;
+      }
+    } catch (error) {
+      logger.error('PlayerManager', 'Error playing track', error);
+      return false;
+    }
+  }
+
+  /**
+   * Save the current player state to the database
+   * @returns {boolean} - Whether the state was saved
+   */
+  saveState() {
+    try {
+      if (!this.player) return false;
+
+      const guildId = this.player.guildId;
+      if (!guildId) return false;
+
+      // Clean and prepare data for saving, avoiding circular references
+      const currentTrack = this.player.queue?.current ? this.cleanTrackForStorage(this.player.queue.current) : null;
+      const queueTracks = this.player.queue?.length ?
+        this.player.queue.map(track => this.cleanTrackForStorage(track)) :
+        [];
+
+      // Save only necessary state data to database
+      db.savePlayerState(guildId, {
+        voiceChannelId: this.player.voiceId,
+        textChannelId: this.player.textId,
+        volume: this.player.volume,
+        loopMode: this.player.loop,
+        paused: this.player.paused,
+        currentTrack: currentTrack,
+        queue: queueTracks
+      });
+
+      return true;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to save player state', error);
+      return false;
+    }
+  }
+
+  /**
+   * Clean track data for storage by removing circular references
+   * @param {object} track - The track to clean
+   * @returns {object} - Cleaned track data
+   */
+  cleanTrackForStorage(track) {
+    if (!track) return null;
+
+    try {
+      // Extract only the necessary track properties
+      return {
+        title: track.title || 'Unknown',
+        author: track.author || 'Unknown Artist',
+        url: track.uri || '',
+        thumbnail: track.thumbnail || '',
+        duration: track.length || 0,
+        isStream: track.isStream || false,
+        identifier: track.identifier || '',
+        requester: track.requester ? {
+          id: track.requester.id,
+          username: track.requester.username,
+          displayName: track.requester.displayName
+        } : null,
+        // For possible raw play fallback
+        encoded: track.encoded,
+        track: track.track,
+        uri: track.uri
+      };
+    } catch (error) {
+      logger.error('PlayerManager', 'Error cleaning track for storage', error);
+      return {
+        title: 'Unknown Track',
+        author: 'Unknown Artist',
+        duration: 0
+      };
+    }
+  }
+
+  /**
+   * Stop playback and clear the queue
+   * @returns {boolean} - Whether the action was successful
+   */
+  stop() {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return false;
+      }
+const is247Enabled = client.db?.is247Enabled?.(this.player.guildId) || false;
+        if(is247Enabled){
+      // Clear the queue
+     this.player.queue.clear()
+        this.player.autoplay = null
+        this.setLoop('none');
+      // Stop playback
+      try {
+        this.player.skip();
+      } catch (error) {
+        // Improved error handling: log and continue
+        logger.error('PlayerManager', 'Error stopping track on node', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to stop track. Will continue.');
+        }
+        // Continue, as stopping should not throw for the user
+      }
+            } else{
+                this.player.destroy()
+                }
+      return true;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to stop playback', error);
+      return false;
+    }
+  }
+
+  /**
+   * Add current track to history before it ends
+   * @param {object} track - The track to add to history
+   * @returns {boolean} - Whether the track was added to history
+   */
+  addToHistory(track) {
+    try {
+      if (!track) return false;
+
+      // Don't add tracks that are being played from history
+      if (track._fromHistory) {
+        
+        return false;
+      }
+
+      // Get guild ID for storing in the correct history
+      const guildId = this.guildId;
+      if (!guildId) {
+        logger.error('PlayerManager', 'Cannot add to history - no guild ID available');
+        return false;
+      }
+
+      // Clean the track to avoid circular references
+      const cleanedTrack = this.cleanTrackForStorage(track);
+
+      // Add voice and text channel IDs for context when creating new player entries
+      cleanedTrack.voiceChannelId = this.voiceChannelId;
+      cleanedTrack.textChannelId = this.textChannelId;
+
+      // Store in database
+      const success = db.player.addTrackToHistory(guildId, cleanedTrack);
+
+      if (success) {
+        
+      } else {
+        logger.warn('PlayerManager', `Failed to add track "${cleanedTrack.title}" to history database`);
+      }
+
+      return success;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to add track to history', error);
+      return false;
+    }
+  }
+
+  /**
+   * Play a track from history without adding it back to history
+   * @param {object} track - The track to play
+   * @param {boolean} fromHistory - Whether this track is from history
+   * @returns {boolean} - Whether the track was played
+   */
+  async trackFromHistory(track, fromHistory = true) {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return false;
+      }
+
+      // Mark the track as from history to prevent re-adding to history
+      track._fromHistory = fromHistory;
+
+
+      // If current track exists, add it back to the queue at position 0
+      if (this.queue.current) {
+        // Save the current track
+        const currentTrack = this.cleanTrackForStorage(this.queue.current);
+        
+
+        // Mark current track as "not from history" to get proper history tracking
+        currentTrack._fromHistory = false;
+
+        // Add current track at the beginning of the queue
+        if (Array.isArray(this.player.queue)) {
+          this.player.queue.unshift(currentTrack);
+        } else if (typeof this.player.queue === 'object' && typeof this.player.queue.unshift === 'function') {
+          this.player.queue.unshift(currentTrack);
+        } else {
+          logger.error('PlayerManager', 'Failed to add current track to queue');
+        }
+      }
+
+      // Now try playing the track - multiple paths to ensure success
+      let playSuccess = false;
+
+      // Convert to Kazagumo track if needed
+      const convertedTrack = track.encoded || track.track
+        ? track
+        : {
+            title: track.title,
+            author: track.author,
+            uri: track.uri,
+            length: track.duration,
+            isStream: track.isStream,
+            thumbnail: track.thumbnail,
+            requester: track.requester,
+            _fromHistory: true
+          };
+
+      // Method 1: If the track has encoded/track data, try direct playback
+      if ((convertedTrack.encoded || convertedTrack.track) && !playSuccess) {
+        try {
+          
+          await this.player.play(convertedTrack);
+          playSuccess = true;
+          logger.info('PlayerManager', 'Direct playback successful');
+        } catch (directPlayError) {
+          logger.error('PlayerManager', 'Direct playback failed', directPlayError);
+        }
+      }
+
+      // Method 2: If direct playback failed, try resolving the track via Lavalink
+      if (!playSuccess && convertedTrack.uri && this.player.node && typeof this.player.node.rest.resolve === 'function') {
+        try {
+        
+          const searchResult = await this.player.node.rest.resolve(convertedTrack.uri);
+
+          if (searchResult && searchResult.tracks && searchResult.tracks.length > 0) {
+            // Get the first track and add the original metadata
+            const kazagumoTrack = searchResult.tracks[0];
+            kazagumoTrack.requester = convertedTrack.requester;
+            kazagumoTrack._fromHistory = true;
+
+            
+            await this.player.play(kazagumoTrack);
+            playSuccess = true;
+            
+          }
+        } catch (resolveError) {
+          logger.error('PlayerManager', 'Lavalink resolve failed', resolveError);
+        }
+      }
+
+      // Method 3: Search for the track by title as last resort
+      if (!playSuccess && typeof this.player.search === 'function') {
+        try {
+         
+          const searchResults = await this.player.search(convertedTrack.title, {
+            requester: convertedTrack.requester
+          });
+
+          if (searchResults && searchResults.tracks && searchResults.tracks.length > 0) {
+            const firstTrack = searchResults.tracks[0];
+            firstTrack._fromHistory = true;
+
+         
+            await this.player.play(firstTrack);
+            playSuccess = true;
+           
+          }
+        } catch (searchError) {
+          logger.error('PlayerManager', 'Search failed', searchError);
+        }
+      }
+
+      // Method 4: Try Shoukaku direct method if available
+      if (!playSuccess && this.player.shoukaku && convertedTrack.track) {
+        try {
+         
+          await this.player.shoukaku.playTrack({ track: convertedTrack.track });
+          playSuccess = true;
+          
+        } catch (shoukakuError) {
+          logger.error('PlayerManager', 'Shoukaku playback failed', shoukakuError);
+        }
+      }
+
+      return playSuccess;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to play track from history', error);
+      return false;
+    }
+  }
+
+  /**
+   * Pause playback
+   * @returns {boolean} - Whether the action was successful
+   */
+  pause() {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return false;
+      }
+
+      if (this.player.paused) return true;
+
+      // Use Kazagumo's setPaused method
+      try {
+        this.player.pause(true);
+      } catch (error) {
+        logger.error('PlayerManager', 'Error pausing on node', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to pause. Will continue.');
+        }
+        return false;
+      }
+      return true;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to pause playback', error);
+      return false;
+    }
+  }
+
+  /**
+   * Resume playback
+   * @returns {boolean} - Whether the action was successful
+   */
+  resume() {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return false;
+      }
+
+      if (!this.player.paused) return true;
+
+      // Use Kazagumo's setPaused method with false
+      try {
+        this.player.pause(false);
+      } catch (error) {
+        logger.error('PlayerManager', 'Error resuming on node', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to resume. Will continue.');
+        }
+        return false;
+      }
+      return true;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to resume playback', error);
+      return false;
+    }
+  }
+
+  /**
+   * Skip to the next track
+   * @returns {boolean} - Whether the action was successful
+   */
+  skip() {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return false;
+      }
+
+      // Use Kazagumo's skip method
+      try {
+        this.player.skip();
+      } catch (error) {
+        logger.error('PlayerManager', 'Error skipping track on node', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to skip. Will continue.');
+        }
+        return false;
+      }
+      return true;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to skip track', error);
+      return false;
+    }
+  }
+
+  /**
+   * Skip to a specific position in the queue
+   * @param {number} position - Position to skip to (0-based)
+   * @returns {boolean} - Whether the action was successful
+   */
+  skipTo(position) {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return false;
+      }
+
+      // Adjust for 1-based position that users might provide
+      const index = position - 1;
+
+      if (index < 0 || index >= this.queue.size) {
+        return false;
+      }
+
+      // Remove all tracks before the target
+      for (let i = 0; i < index; i++) {
+        this.queue.remove(0);
+      }
+
+      // Skip to play the target track (now at position 0)
+      try {
+        this.player.skip();
+      } catch (error) {
+        logger.error('PlayerManager', 'Error skipping to position on node', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to skip to position. Will continue.');
+        }
+        return false;
+      }
+      return true;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to skip to position', error);
+      return false;
+    }
+  }
+
+  /**
+   * Set the volume
+   * @param {number} volume - Volume to set (0-100)
+   * @returns {number} - The new volume
+   */
+  setVolume(volume) {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return 100;
+      }
+
+      // Ensure volume is within valid range
+      const newVolume = Math.max(0, Math.min(100, volume));
+
+      try {
+        this.player.setVolume(newVolume);
+      } catch (error) {
+        logger.error('PlayerManager', 'Error setting volume on node', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to set volume. Will continue.');
+        }
+        // Return previous or default volume
+        return this.player?.volume || 100;
+      }
+      return newVolume;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to set volume', error);
+      return this.player?.volume || 100;
+    }
+  }
+
+  /**
+   * Seek to a position
+   * @param {number} position - Position in milliseconds
+   * @returns {boolean} - Whether the action was successful
+   */
+  seek(position) {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return false;
+      }
+
+      if (!this.queue.current) return false;
+
+      const maxDuration = this.queue.current.length;
+
+      // Ensure position is within valid range
+      const validPosition = Math.max(0, Math.min(maxDuration, position));
+
+      try {
+        this.player.seek(validPosition);
+      } catch (error) {
+        logger.error('PlayerManager', 'Error seeking on node', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to seek. Will continue.');
+        }
+        return false;
+      }
+      return true;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to seek', error);
+      return false;
+    }
+  }
+
+  /**
+   * Set the loop mode
+   * @param {string} mode - Loop mode ('none', 'track', 'queue')
+   * @returns {string} - The new loop mode
+   */
+  setLoop(mode) {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return 'none';
+      }
+
+      if (!['none', 'track', 'queue'].includes(mode)) {
+        mode = 'none';
+      }
+
+      try {
+        this.player.setLoop(mode);
+      } catch (error) {
+        logger.error('PlayerManager', 'Error setting loop mode on node', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to set loop mode. Will continue.');
+        }
+        return this.player?.loop || 'none';
+      }
+      return mode;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to set loop mode', error);
+      return this.player?.loop || 'none';
+    }
+  }
+
+  /**
+   * Get the player status
+   * @returns {object} - The player status
+   */
+  getStatus() {
+    if (!this.player) {
+      return {
+        playing: false,
+        current: null,
+        position: 0,
+        volume: 100,
+        loop: 'none',
+        queueSize: 0,
+        queueDuration: 0,
+        autoplay: false
+      };
+    }
+
+    return {
+      playing: !this.player.paused,
+      current: this.queue.current,
+      position: this.player.position || 0,
+      volume: this.player.volume || 100,
+      loop: this.player.loop || 'none',
+      queueSize: this.queue.size,
+      queueDuration: this.queue.duration,
+      autoplay: this.player.options?.autoplay || false
+    };
+  }
+
+  /**
+   * Clean up the player
+   * @returns {boolean} - Whether the action was successful
+   */
+  destroy() {
+    try {
+      if (!this.player) {
+        logger.error('PlayerManager', 'Player is undefined');
+        return false;
+      }
+
+      const guildId = this.player.guildId;
+
+      if (!guildId) return false;
+
+      // Delete player state from database
+      db.deletePlayerState(guildId);
+
+      // Destroy the player
+      try {
+          if(this.player){
+        this.player.destroy();
+              }
+      } catch (error) {
+        logger.error('PlayerManager', 'Error destroying player on node', error);
+        if (error.message && error.message.includes('No available nodes')) {
+          logger.warn('PlayerManager', 'No available nodes to destroy player. Will continue.');
+        }
+        // Continue, as destroy should not throw for the user
+      }
+
+      return true;
+    } catch (error) {
+      logger.error('PlayerManager', 'Failed to destroy player', error);
+      return false;
+    }
+  }
+}
